@@ -1,0 +1,12 @@
+ctxschedd: observe mode, interval 100 ms, weights default=100 batch=50 interactive=200 latency=400
+t=  0.60s pid 535    wl_batch        -> batch       (conf 1.00) [observe]
+t=  0.60s pid 537    wl_batch        -> batch       (conf 1.00) [observe]
+t=  0.60s pid 539    wl_batch        -> batch       (conf 1.00) [observe]
+t=  0.60s pid 542    wl_batch        -> batch       (conf 1.00) [observe]
+t=  0.60s pid 544    wl_interactive  -> interactive (conf 1.00) [observe]
+t=  0.60s pid 551    wl_latency      -> latency     (conf 1.00) [observe]
+t=  0.60s pid 553    wl_latency      -> latency     (conf 1.00) [observe]
+t=  0.60s pid 555    wl_latency      -> latency     (conf 1.00) [observe]
+t=  0.70s pid 546    wl_interactive  -> interactive (conf 0.94) [observe]
+t=  0.70s pid 549    wl_interactive  -> interactive (conf 1.00) [observe]
+ctxschedd: stopped

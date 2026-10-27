@@ -1,0 +1,16 @@
+ctxschedd: adaptive mode, interval 100 ms, weights default=100 batch=50 interactive=200 latency=400
+t=  0.70s pid 461    wl_batch        -> batch       (conf 1.00)
+t=  0.70s pid 463    wl_batch        -> batch       (conf 1.00)
+t=  0.70s pid 465    wl_batch        -> batch       (conf 1.00)
+t=  0.70s pid 467    ph_batch        -> batch       (conf 1.00)
+t=  0.70s pid 471    ph_batch        -> batch       (conf 1.00)
+t=  0.70s pid 475    wl_latency      -> latency     (conf 1.00)
+t=  0.80s pid 469    ph_interactive  -> interactive (conf 1.00)
+t=  0.80s pid 473    ph_interactive  -> interactive (conf 1.00)
+t=  4.60s pid 471    ph_latency      -> interactive (conf 0.87)
+t=  4.70s pid 467    ph_latency      -> interactive (conf 0.49)
+t=  4.80s pid 469    ph_batch        -> batch       (conf 1.00)
+t=  4.80s pid 473    ph_batch        -> batch       (conf 1.00)
+t=  5.00s pid 467    ph_latency      -> latency     (conf 0.97)
+t=  5.10s pid 471    ph_latency      -> latency     (conf 1.00)
+ctxschedd: stopped

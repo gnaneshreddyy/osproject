@@ -1,0 +1,10 @@
+ctxschedd: adaptive mode, interval 100 ms, weights default=100 batch=50 interactive=200 latency=400
+t=  0.70s pid 352    stress-ng       -> batch       (conf 1.00)
+t=  0.70s pid 355    sysbench        -> batch       (conf 1.00)
+t=  0.70s pid 356    fio             -> batch       (conf 1.00)
+t=  0.70s pid 358    cyclictest      -> latency     (conf 1.00)
+t=  0.70s pid 360    wl_interactive  -> interactive (conf 1.00)
+t=  0.70s pid 363    stress-ng-cpu   -> batch       (conf 1.00)
+t=  0.70s pid 364    stress-ng-cpu   -> batch       (conf 1.00)
+t=  1.10s pid 356    fio             -> interactive (conf 1.00)
+ctxschedd: stopped

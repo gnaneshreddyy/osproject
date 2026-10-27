@@ -1,0 +1,38 @@
+---
+system-info:
+      stress-ng-version: 0.17.06
+      run-by: root
+      date-yyyy-mm-dd: 2026:10:27
+      time-hh-mm-ss: 20:02:51
+      epoch-secs: 1793131371
+      hostname: GNANESH
+      sysname: Linux
+      nodename: GNANESH
+      release: 6.6.87.2-microsoft-standard-WSL2
+      version: '#1 SMP PREEMPT_DYNAMIC Thu Jun  5 18:30:46 UTC 2025'
+      machine: x86_64
+      compiler: 'gcc 13.2.0'
+      uptime: 11
+      totalram: 12420546560
+      freeram: 11482177536
+      sharedram: 31342592
+      bufferram: 94584832
+      totalswap: 3221225472
+      freeswap: 3221225472
+      pagesize: 4096
+      cpus: 20
+      cpus-online: 20
+      ticks-per-second: 100
+
+metrics:
+    - stressor: cpu
+      bogo-ops: 11726
+      bogo-ops-per-second-usr-sys-time: 2389.814978
+      bogo-ops-per-second-real-time: 1465.515898
+      wall-clock-time: 8.001278
+      user-time: 4.867504
+      system-time: 0.039152
+      cpu-usage-per-instance: 30.661702
+      max-rss: 5684
+
+...

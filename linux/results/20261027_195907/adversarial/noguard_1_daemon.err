@@ -1,0 +1,11 @@
+ctxschedd: adaptive mode (no guard), interval 100 ms, weights default=100 batch=50 interactive=200 latency=400
+t=  0.70s pid 571    adv_batch       -> latency     (conf 0.46)
+t=  0.70s pid 572    adv_batch       -> latency     (conf 0.41)
+t=  0.70s pid 574    wl_batch        -> batch       (conf 1.00)
+t=  0.70s pid 576    wl_batch        -> batch       (conf 1.00)
+t=  0.70s pid 582    wl_latency      -> latency     (conf 1.00)
+t=  0.70s pid 584    wl_latency      -> latency     (conf 1.00)
+t=  0.70s pid 586    wl_latency      -> latency     (conf 1.00)
+t=  0.80s pid 578    wl_interactive  -> interactive (conf 0.94)
+t=  0.80s pid 580    wl_interactive  -> interactive (conf 1.00)
+ctxschedd: stopped

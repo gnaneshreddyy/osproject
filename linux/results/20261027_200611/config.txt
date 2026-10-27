@@ -1,0 +1,3 @@
+kernel=6.6.87.2-microsoft-standard-WSL2
+scenarios=mixed phase adversarial tools reps=10 duration_s=20 core=0 daemon_core=1
+n_batch=4 n_interactive=3 n_latency=3 batch_work_ms=3000 sysbench_events=20000
