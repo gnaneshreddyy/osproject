@@ -1,0 +1,5 @@
+# Scripts and sources run inside Linux/WSL: keep LF even on a Windows checkout
+*.sh       text eol=lf
+*.py       text eol=lf
+*.c        text eol=lf
+Makefile   text eol=lf

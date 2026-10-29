@@ -1,3 +1,0 @@
-kernel=6.6.87.2-microsoft-standard-WSL2
-scenarios=phase reps=2 duration_s=8 core=0 daemon_core=1
-n_batch=4 n_interactive=3 n_latency=3 batch_work_ms=1500 sysbench_events=20000

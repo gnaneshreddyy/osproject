@@ -170,6 +170,7 @@ in `/proc/<pid>/task/*`:
 | `wait_ns` | `schedstat`, field 2 | total time runnable but waiting in the run queue |
 | `vol` | `voluntary_ctxt_switches` in `/proc/<pid>/task/<tid>/status` | times the task gave up the CPU by itself (sleep, I/O, lock): one per block/wake cycle |
 | `io_bytes` | `read_bytes` + `write_bytes` in `/proc/<pid>/io` | bytes that actually went to or from storage |
+| `blkio` | field 42 (`delayacct_blkio_ticks`) of `/proc/<pid>/task/<tid>/stat` | time spent waiting for synchronous block I/O, in clock ticks (needs kernel delay accounting, which the daemon switches on) |
 
 `signals_from_deltas()` takes the difference between this sample and the
 previous one (Δt ≈ 100 ms) and derives:
@@ -181,6 +182,7 @@ previous one (Δt ≈ 100 ms) and derives:
 | `wake_s` | Δvol / Δt | wake-ups per second |
 | `burst_ms` | Δcpu / Δvol (or Δcpu if it never slept) | CPU used per wake-up |
 | `io_mbps` | Δio_bytes / Δt / 10⁶ | storage throughput |
+| `io_wait` | Δblkio / CLK_TCK / Δt | fraction of the time spent waiting on the disk |
 
 If a thread exits, the summed counters can shrink. `delta()` clamps negative
 differences to 0. `ewma_update()` then smooths each signal with an
@@ -205,10 +207,13 @@ The rules are checked in order:
 
 | # | Rule | Conditions | Why |
 |---|---|---|---|
-| 1 | **I/O-bound → interactive** | `sleep_frac ≥ 0.4` and `io_mbps ≥ 1` | A disk-heavy task (e.g. fio) wakes often with tiny bursts, so without this rule it would look latency-sensitive. |
-| 2 | **Latency** | `wake_s ≥ 50`, `burst_ms ≤ 2`, and *guard*: `sleep_frac ≥ 0.5` | Frequent wake-ups with tiny bursts. The guard demands that the task really sleeps more than it computes. |
-| 3 | **Interactive** | `sleep_frac ≥ 0.4` and `wake_s ≥ 2` | Mostly asleep, wakes regularly. |
+| 1 | **I/O-bound → interactive** | `io_wait ≥ cpu_share` and `io_wait ≥ 0.01` | The textbook definition of I/O-bound: more time waiting for I/O than computing. A disk-heavy task (e.g. fio) wakes often with tiny bursts, so without this rule it would look latency-sensitive. If delay accounting is unavailable: `sleep_frac ≥ 0.625` and `io_mbps ≥ 1`. |
+| 2 | **Latency** | `wake_s ≥ 40`, `burst_ms ≤ base slice` (3 ms here), and *guard*: `sleep_frac ≥ 0.625` | Periodic work with a period of 25 ms or less whose burst fits in one scheduler slice. The guard demands that the task genuinely sleeps. |
+| 3 | **Interactive** | `sleep_frac ≥ 0.625` and `wake_s ≥ 1` | Mostly asleep, woken at least once a second. |
 | 4 | **Batch** | everything else | The conservative default: the lowest weight is the safe mistake. |
+
+Every threshold is tied to an outside reference or to our own measurements;
+see §3.9.
 
 **Confidence.** Each rule has a *margin*: how far the signals sit past its
 thresholds. Rate-type signals use a log₂ scale, so a margin of 1.0 means "a
@@ -232,6 +237,15 @@ weight by sleeping for a moment between bursts (1.5 ms run, 0.2 ms nap gives
 about 600 wake-ups/s with 1.5 ms bursts). Without the guard, rule 2 accepts
 it. With the guard, its `sleep_frac` is only about 0.12, so it is classed as
 batch. `--no-guard` turns the guard off for the ablation experiment.
+
+At startup the daemon also reads the kernel's EEVDF base slice from
+`/sys/kernel/debug/sched/base_slice_ns`, or computes it the way the kernel
+does when debugfs isn't mounted. It switches on per-task delay accounting
+(`kernel.task_delayacct = 1`) so block-I/O wait can be measured. It prints
+both on its second line:
+```
+ctxschedd: latency burst limit 3.00 ms (kernel base slice), I/O rule uses block-I/O delay accounting
+```
 
 ### 3.5 Stage 3: Weight mapper / cgroup writer
 `move_to_class()` writes the PID into
@@ -265,7 +279,7 @@ t=  0.70s pid 399    wl_latency      -> latency     (conf 1.00)
 ### 3.7 The log (`--log FILE`)
 There is one row per PID per tick:
 
-`t_s, pid, comm, truth, cpu_share, blocked, sleep_frac, wake_s, burst_ms, io_mbps, raw_class, conf, decision, moved`
+`t_s, pid, comm, truth, cpu_share, blocked, sleep_frac, wake_s, burst_ms, io_mbps, io_wait, raw_class, conf, decision, moved`
 
 - `raw_class` is the classifier's answer for this sample.
 - `decision` is the class after the fallback and hysteresis, which is what was
@@ -285,6 +299,27 @@ can be measured. **The classifier never sees this value.**
 
 The name is re-read every tick, so a phase change is detected the moment the
 task renames itself.
+
+### 3.9 Why these values: evidence for each threshold
+The first version used hand-picked thresholds. Each one was then checked
+against published schedulers, kernel definitions and our own measurements, and
+several were changed. The report's §4.5 has the full argument and references.
+
+| Parameter | Old | New | Evidence |
+|---|---|---|---|
+| Sleep threshold (interactive rule and latency guard) | 0.40 / 0.50 | **0.625** | FreeBSD's ULE scheduler (`sched_ule.c`) scores interactivity as `50 × run/sleep` when sleep > run, and treats a thread as interactive below a score of 30. That means run/sleep < 0.6, i.e. sleep/(sleep+run) > 0.625. ULE measures *voluntary* sleep and excludes run-queue wait, the same definition as our `sleep_frac`. |
+| Latency burst limit | 2 ms | **kernel base slice** (3 ms here) | Linux 6.6 `fair.c`: `sysctl_sched_base_slice` is the "minimal preemption granularity", 0.75 ms × (1 + ilog2(min(CPUs, 8))). Read live from debugfs: 3,000,000 ns. A burst that fits in one slice finishes without being preempted. |
+| Latency wake-up rate | 50/s | **40/s** (period ≤ 25 ms) | PipeWire's default audio quantum is 1024 frames at 48 kHz = 21.3 ms, about 47 wake-ups/s, which the old 50/s limit would have missed. 25 ms also covers 50/60 Hz frame loops and is a quarter of the 0.1 s "feels instantaneous" limit (Miller 1968; Card et al. 1991; Nielsen 1993). |
+| Interactive wake-up rate | 2/s | **1/s** | The 1 s "flow of thought" limit from the same human-factors work: a task woken less often than that has no responsiveness requirement that a weight could improve. |
+| I/O-bound rule | sleep ≥ 0.4 and ≥ 1 MB/s | **block-I/O wait ≥ CPU time** (and ≥ 1% of the time) | The textbook definition: an I/O-bound process spends more time doing I/O than computing (Silberschatz et al.). Block-I/O wait is measured directly by kernel delay accounting ("waiting for synchronous block I/O to complete"). Measured over the 10-repetition runs: fio waits on the disk for a median 70% of the time but computes only ≈ 4%; every CPU-bound and latency tool waits 0%. The MB/s rule remains only as a fallback. |
+| Confidence fallback | 0.25 | 0.25 (kept) | Measured noise: the coefficient of variation of the smoothed wake-up rate is ≈ 5% typically and ≈ 28% for the most variable workloads (90th percentile). A margin of 0.25 is a ±19% band on rates and ±0.05 on sleep fraction, in between, so decisions that ordinary noise could reverse are treated as uncertain. |
+| Hysteresis length | 3 | 3 (kept) | Measured raw error rate for correctly-behaving tasks away from a class boundary is at most 0.09% per sample. A false switch needs N wrong samples in a row: p³ ≈ 7×10⁻¹⁰ per sample, about once per 4.5 years per process at 10 samples/s. N = 2 would give one false switch every ~1.5 days. (fio's rare errors cluster at the I/O boundary when it is starved of CPU; the confidence fallback handles those.) |
+| EWMA α | 0.4 | 0.4 (kept) | Half-life = ln 0.5 / ln 0.6 ≈ 1.4 samples ≈ 140 ms. Together with the hysteresis this gives a measured reaction time of about 0.5–0.6 s, inside the 1 s limit above. |
+
+The class weights (50 / 100 / 200 / 400) can also be read in kernel terms. The
+kernel's `sched_prio_to_weight` table changes weight by ×1.25 per nice level.
+So latency (×4) ≈ nice −6, interactive (×2) ≈ nice −3, and batch (×0.5) ≈
+nice +3.
 
 ---
 

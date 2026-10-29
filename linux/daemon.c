@@ -45,16 +45,38 @@ static const char *CLASS_DIR[N_CLASSES]   = { "pending", "batch", "interactive",
 /* Weight mapper: replaces the simulator's quantum mapper (20/6/2 ms, 10 ms default). */
 static const int   CLASS_WEIGHT[N_CLASSES] = { 100, 50, 200, 400 };
 
-/* classifier thresholds, tuned for real /proc signals */
-#define LAT_MIN_WAKE    50.0   /* wake-ups per second            */
-#define LAT_MAX_BURST    2.0   /* ms of CPU per wake-up          */
-#define LAT_MIN_SLEEP    0.50  /* guard: latency tasks sleep more than they compute */
-#define INT_MIN_SLEEP    0.40  /* sleep fraction (see sleep_frac) */
-#define INT_MIN_WAKE     2.0   /* wake-ups per second            */
-#define IO_MIN_MBPS      1.0   /* storage bytes per second for the I/O-bound rule */
+/*
+ * Classifier thresholds. Each one is anchored to an external reference (see
+ * the "Core classifier" section of README.md for the full argument):
+ *
+ * SLEEP_MIN      FreeBSD ULE calls a thread interactive when its score
+ *                50 * run/sleep is below 30, i.e. run/sleep < 0.6, i.e.
+ *                sleep/(sleep+run) > 0.625. ULE measures voluntary sleep and
+ *                excludes run-queue wait, exactly like sleep_frac below.
+ * LAT_MIN_WAKE   period <= 25 ms: covers PipeWire's default audio quantum
+ *                (1024 frames / 48 kHz = 21.3 ms) and 50/60 Hz frame loops,
+ *                and is well inside the 0.1 s "instantaneous" limit.
+ * lat_max_burst  the kernel's own EEVDF base slice (0.75 ms * (1 + log2 CPUs),
+ *                3 ms here): work per wake-up fits in one slice, so the task
+ *                never needs to be preempted to finish its burst.
+ * INT_MIN_WAKE   at least one event per second, the 1 s flow-of-thought limit.
+ * I/O-bound      the textbook definition: more time waiting for I/O than
+ *                computing. Block-I/O wait comes from kernel delay accounting;
+ *                without it, fall back to storage throughput.
+ * CONF_MIN, HYST_N, EWMA_ALPHA are fitted to measured signal noise.
+ */
+#define SLEEP_MIN        0.625 /* ULE interactivity threshold, as a sleep fraction */
+#define LAT_MIN_WAKE    40.0   /* wake-ups per second (period <= 25 ms) */
+#define INT_MIN_WAKE     1.0   /* wake-ups per second            */
+#define IO_MIN_WAIT      0.01  /* ignore block-I/O wait below 1% of the time */
+#define IO_MIN_MBPS      1.0   /* fallback I/O rule when delay accounting is off */
 #define CONF_MIN         0.25  /* below this -> fall back to default weight */
 #define HYST_N           3     /* consecutive agreeing samples before switching */
 #define EWMA_ALPHA       0.4
+
+static double lat_max_burst = 3.0;   /* ms; replaced by the kernel's base slice at startup */
+static int    have_delayacct;        /* per-task block-I/O delay available */
+static double clk_tck = 100.0;       /* units of /proc/<pid>/stat field 42 */
 
 /* ------------------------ pipeline stage 1: signal collector ------------------------ */
 
@@ -63,6 +85,7 @@ typedef struct {
     unsigned long long wait_ns;   /* time runnable, waiting (schedstat field 2) */
     unsigned long long vol;       /* voluntary context switches = times it blocked */
     unsigned long long io_bytes;  /* read_bytes + write_bytes from /proc/<pid>/io */
+    unsigned long long blkio;     /* block-I/O delay, clock ticks (stat field 42) */
 } Counters;
 
 typedef struct {
@@ -71,6 +94,7 @@ typedef struct {
     double wake_s;        /* wake-ups per second                   */
     double burst_ms;      /* CPU time per wake-up                  */
     double io_mbps;       /* storage I/O, MB per second            */
+    double io_wait;       /* fraction of wall time waiting for block I/O */
 } Signals;
 
 typedef struct {
@@ -125,6 +149,19 @@ static int read_counters(int pid, Counters *c) {
                 if (sscanf(line, "voluntary_ctxt_switches: %llu", &v) == 1) c->vol += v;
             fclose(f);
         }
+
+        /* field 42 (delayacct_blkio_ticks) is per thread, so sum it here */
+        snprintf(path, sizeof(path), "/proc/%d/task/%s/stat", pid, e->d_name);
+        f = fopen(path, "r");
+        if (f) {
+            char buf[1024];
+            size_t len = fread(buf, 1, sizeof(buf) - 1, f);
+            buf[len] = 0;
+            char *p = strrchr(buf, ')');       /* comm may contain spaces */
+            for (int field = 2; p && field < 42; field++) p = strchr(p + 1, ' ');
+            if (p) c->blkio += strtoull(p + 1, NULL, 10);
+            fclose(f);
+        }
     }
     closedir(d);
 
@@ -159,6 +196,8 @@ static Signals signals_from_deltas(const Counters *a, const Counters *b, double 
     s.wake_s    = vol / dt;
     s.burst_ms  = vol > 0 ? cpu_ms / vol : cpu_ms;   /* never blocked: one long burst */
     s.io_mbps   = delta(b->io_bytes, a->io_bytes) / 1e6 / dt;
+    s.io_wait   = delta(b->blkio, a->blkio) / clk_tck / dt;
+    if (s.io_wait > 1) s.io_wait = 1;
     return s;
 }
 
@@ -169,6 +208,7 @@ static void ewma_update(Proc *p, const Signals *s) {
     p->ewma.wake_s    = EWMA_ALPHA * s->wake_s    + (1 - EWMA_ALPHA) * p->ewma.wake_s;
     p->ewma.burst_ms  = EWMA_ALPHA * s->burst_ms  + (1 - EWMA_ALPHA) * p->ewma.burst_ms;
     p->ewma.io_mbps   = EWMA_ALPHA * s->io_mbps   + (1 - EWMA_ALPHA) * p->ewma.io_mbps;
+    p->ewma.io_wait   = EWMA_ALPHA * s->io_wait   + (1 - EWMA_ALPHA) * p->ewma.io_wait;
 }
 
 /* ------------------------ pipeline stage 2: heuristic classifier ------------------------ */
@@ -200,10 +240,12 @@ static double sleep_frac(const Signals *s) {
 static Class classify(const Signals *s, double *conf) {
     double burst = s->burst_ms > 1e-6 ? s->burst_ms : 1e-6;
     double sleep = sleep_frac(s);
-    double m_io  = fmin((sleep - INT_MIN_SLEEP) / 0.2, lg2(s->io_mbps / IO_MIN_MBPS));
-    double m_lat = fmin(lg2(s->wake_s / LAT_MIN_WAKE), lg2(LAT_MAX_BURST / burst));
-    if (guard) m_lat = fmin(m_lat, (sleep - LAT_MIN_SLEEP) / 0.2);
-    double m_int = fmin((sleep - INT_MIN_SLEEP) / 0.2, lg2(s->wake_s / INT_MIN_WAKE));
+    double m_io  = have_delayacct
+        ? fmin(lg2(s->io_wait / (s->cpu_share > 1e-6 ? s->cpu_share : 1e-6)), lg2(s->io_wait / IO_MIN_WAIT))
+        : fmin((sleep - SLEEP_MIN) / 0.2, lg2(s->io_mbps / IO_MIN_MBPS));
+    double m_lat = fmin(lg2(s->wake_s / LAT_MIN_WAKE), lg2(lat_max_burst / burst));
+    if (guard) m_lat = fmin(m_lat, (sleep - SLEEP_MIN) / 0.2);
+    double m_int = fmin((sleep - SLEEP_MIN) / 0.2, lg2(s->wake_s / INT_MIN_WAKE));
 
     Class c; double m;
     if (m_io > 0)       { c = C_INTERACTIVE; m = m_io; }
@@ -247,6 +289,42 @@ static int apply_weights(void) {
         }
     }
     return 0;
+}
+
+/*
+ * Read the kernel's EEVDF base slice (debugfs, root only) or derive it the way
+ * the kernel does: 0.75 ms * (1 + ilog2(min(ncpus, 8))). Turn on per-task
+ * delay accounting (kernel.task_delayacct, Linux 5.14+) so block-I/O wait can
+ * be measured; tasks started before this have no delay data.
+ */
+static void init_kernel_params(void) {
+    long t = sysconf(_SC_CLK_TCK);
+    if (t > 0) clk_tck = (double)t;
+
+    FILE *f = fopen("/sys/kernel/debug/sched/base_slice_ns", "r");
+    unsigned long long ns = 0;
+    if (f) {
+        if (fscanf(f, "%llu", &ns) != 1) ns = 0;
+        fclose(f);
+    }
+    if (ns) {
+        lat_max_burst = ns / 1e6;
+    } else {
+        long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+        if (cpus > 8) cpus = 8;
+        int lg = 0;
+        while (cpus > 1) { cpus >>= 1; lg++; }
+        lat_max_burst = 0.75 * (1 + lg);
+    }
+
+    write_file("/proc/sys/kernel/task_delayacct", "1\n");
+    f = fopen("/proc/sys/kernel/task_delayacct", "r");
+    int on = 0;
+    if (f) {
+        if (fscanf(f, "%d", &on) != 1) on = 0;
+        fclose(f);
+    }
+    have_delayacct = on == 1;
 }
 
 /* ------------------------ process table ------------------------ */
@@ -366,12 +444,13 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (apply_weights() != 0) return 1;
+    init_kernel_params();
 
     FILE *log = NULL;
     if (log_path) {
         log = fopen(log_path, "w");
         if (!log) { perror(log_path); return 1; }
-        fprintf(log, "t_s,pid,comm,truth,cpu_share,blocked,sleep_frac,wake_s,burst_ms,io_mbps,raw_class,conf,decision,moved\n");
+        fprintf(log, "t_s,pid,comm,truth,cpu_share,blocked,sleep_frac,wake_s,burst_ms,io_mbps,io_wait,raw_class,conf,decision,moved\n");
     }
 
     signal(SIGINT, on_signal);
@@ -381,6 +460,8 @@ int main(int argc, char **argv) {
             observe ? "observe" : "adaptive", guard ? "" : " (no guard)", interval_ms,
             CLASS_WEIGHT[C_DEFAULT], CLASS_WEIGHT[C_BATCH],
             CLASS_WEIGHT[C_INTERACTIVE], CLASS_WEIGHT[C_LATENCY]);
+    fprintf(stderr, "ctxschedd: latency burst limit %.2f ms (kernel base slice), I/O rule uses %s\n",
+            lat_max_burst, have_delayacct ? "block-I/O delay accounting" : "storage throughput (delay accounting off)");
 
     double t0 = now_s();
     struct timespec next;
@@ -423,11 +504,11 @@ int main(int argc, char **argv) {
             }
 
             if (log)
-                fprintf(log, "%.3f,%d,%s,%s,%.4f,%.4f,%.4f,%.2f,%.3f,%.3f,%s,%.3f,%s,%d\n",
+                fprintf(log, "%.3f,%d,%s,%s,%.4f,%.4f,%.4f,%.2f,%.3f,%.3f,%.4f,%s,%.3f,%s,%d\n",
                         t - t0, p->pid, p->comm,
                         p->truth >= 0 ? CLASS_NAME[p->truth] : "unknown",
                         p->ewma.cpu_share, p->ewma.blocked, sleep_frac(&p->ewma),
-                        p->ewma.wake_s, p->ewma.burst_ms, p->ewma.io_mbps,
+                        p->ewma.wake_s, p->ewma.burst_ms, p->ewma.io_mbps, p->ewma.io_wait,
                         CLASS_NAME[raw], conf, CLASS_NAME[p->current], moved);
         }
         if (log) fflush(log);
